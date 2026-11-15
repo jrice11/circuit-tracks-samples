@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+test/data.js
+# Never commit audio or backups: they are other people's samples.
+*.wav
+*.WAV
+*.flac
+*.mp3
+*.ogg
+*.aif
+*.aiff
+*.pcapng
+Tracks-backup*/

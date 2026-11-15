@@ -1,0 +1,124 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>tracks_core.js test</title>
+<pre id="out"></pre>
+<script src="../tracks_core.js"></script>
+<script src="fake_tracks.js"></script>
+<script src="data.js"></script>
+<script>
+"use strict";
+// Run by test/run.sh in headless Chrome. The data file is made there from tools/tracks_samples.py,
+// so these checks compare the JavaScript with the Python tool that was matched to a Novation Components capture.
+const T = TracksCore, out = document.getElementById("out");
+let fails = 0, checks = 0;
+function check(name, ok, detail) {
+  checks++;
+  if (!ok) fails++;
+  out.textContent += (ok ? "ok   " : "FAIL ") + name + (ok ? "" : "  " + (detail || "")) + "\n";
+}
+const fromHex = (h) => Uint8Array.from(h.match(/../g).map((x) => parseInt(x, 16)));
+const toHex = (a) => Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
+
+for (const c of TEST_DATA.uploads) {
+  const wav = fromHex(c.wav);
+  const { msgs, acks } = T.buildUpload(c.pack, c.slot, wav, c.name);
+  check(c.label + ": message count", msgs.length === c.msgs.length, msgs.length + " vs " + c.msgs.length);
+  check(c.label + ": every message identical to python", msgs.every((m, i) => toHex(m) === c.msgs[i]));
+  check(c.label + ": every acknowledgement identical to python", acks.every((m, i) => toHex(m) === c.acks[i]));
+  check(c.label + ": crc32", T.crc32(wav) === c.crc, T.crc32(wav) + " vs " + c.crc);
+  check(c.label + ": all data bytes are 7-bit", msgs.every((m) => m.every((b, i) => b < 0x80 || i === 0 || i === m.length - 1)));
+  const back = T.parseDownload(msgs.map((m) => m), c.pack, c.slot);
+  check(c.label + ": parseDownload gives the wav back", back && toHex(back) === c.wav);
+  const broken = msgs.filter((_, i) => i !== 2);
+  let threw = false;
+  try { T.parseDownload(broken, c.pack, c.slot); } catch (e) { threw = true; }
+  check(c.label + ": a missing chunk is refused", c.msgs.length <= 4 || threw);
+}
+check("parseDownload of nothing is null", T.parseDownload([], 8, 3) === null);
+for (const [name, slot] of TEST_DATA.koala) check("koalaSlot " + name, T.koalaSlot(name) === slot, T.koalaSlot(name) + " vs " + slot);
+for (const [slot, file, name] of TEST_DATA.names) check("defaultName " + slot + " " + file, T.defaultName(slot, file) === name, T.defaultName(slot, file) + " vs " + name);
+{
+  const f = (n) => ({ name: n });
+  const p = T.planBulk([f("C02.wav"), f("A01.wav"), f("D16.wav")], null);
+  check("planBulk koala order and slots", p.map((x) => x.slot).join() === "0,33,63", p.map((x) => x.slot).join());
+  const q = T.planBulk([f("b.wav"), f("a.wav")], 4);
+  check("planBulk --start", q.map((x) => x.file.name + x.slot).join() === "a.wav4,b.wav5", q.map((x) => x.file.name + x.slot).join());
+  const err = (fn) => { try { fn(); return ""; } catch (e) { return e.message; } };
+  check("planBulk refuses non-Koala names", /not Koala/.test(err(() => T.planBulk([f("kick.wav")], null))));
+  check("planBulk refuses a duplicate slot", /same slot/.test(err(() => T.planBulk([f("A01.wav"), f("A1.wav")], null))));
+  check("planBulk refuses past slot 64", /past slot 64/.test(err(() => T.planBulk([f("a.wav"), f("b.wav")], 63))));
+  const fr = T.planFree([f("snare 10.wav"), f("kick.wav"), f("snare 2.wav")], [0, 2]);
+  check("planFree skips used slots and sorts names with numbers as numbers",
+    fr.map((x) => x.file.name + ":" + x.slot).join() === "kick.wav:1,snare 2.wav:3,snare 10.wav:4", fr.map((x) => x.file.name + ":" + x.slot).join());
+  check("planFree takes any file name", T.planFree([f("whatever (final) v2.mp3")], []).map((x) => x.slot).join() === "0");
+  const all63 = Array.from({ length: 63 }, (_, i) => i);
+  check("planFree uses the last free slot", T.planFree([f("a.wav")], all63)[0].slot === 63);
+  check("planFree refuses when there are too few free slots", /only 1 free slots/.test(err(() => T.planFree([f("a.wav"), f("b.wav")], all63))), err(() => T.planFree([f("a.wav"), f("b.wav")], all63)));
+}
+{
+  const data = Uint8Array.from({ length: 1000 }, (_, i) => (i * 37 + 11) & 0xFF);
+  for (const n of [0, 1, 6, 7, 8, 13, 14, 15, 1000]) {
+    const d = data.subarray(0, n);
+    check("encode7/decode7 round trip, " + n + " bytes", toHex(T.decode7(T.encode7(d))) === toHex(d));
+  }
+  check("nib/unnib 0x0FFFFFFF", T.unnib(T.nib(0x0FFFFFFF, 8)) === 0x0FFFFFFF);
+  check("nib of a value past 31 bits", T.unnib(T.nib(0xC1EC5D8C, 8)) === 0xC1EC5D8C);
+  check("crc32 of '123456789'", T.crc32(new TextEncoder().encode("123456789")) === 0xCBF43926);
+}
+const wavOf = (n, seed) => {
+  const pcm = Uint8Array.from({ length: n }, (_, i) => (i * seed + (i >> 3) * 5 + 128) & 0xFF);
+  const h = new Uint8Array(44), dv = new DataView(h.buffer);
+  h.set([82, 73, 70, 70], 0); dv.setUint32(4, 36 + n, true); h.set([87, 65, 86, 69, 102, 109, 116, 32], 8);
+  dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true); dv.setUint32(24, 48000, true);
+  dv.setUint32(28, 96000, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true); h.set([100, 97, 116, 97], 36);
+  dv.setUint32(40, n, true);
+  return T.concat(h, pcm);
+};
+const rejects = async (fn) => { try { await fn(); return ""; } catch (e) { return e.message; } };
+
+async function simTests() {
+  let f = new FakeTracks();
+  const A = wavOf(20000, 7), B = wavOf(100, 9);
+  const jobs = [{ slot: 32, wav: A, name: "32_A.wav" }, { slot: 33, wav: B, name: "33_B.wav" }];
+  const steps = [];
+  const n = await T.bulkUpload(f, 8, jobs, { onStep: (j, s) => steps.push(j.slot + s) });
+  check("sim: bulkUpload returns the count", n === 2, n);
+  check("sim: both samples stored identical", T.same(f.slots.get("8:32"), A) && T.same(f.slots.get("8:33"), B));
+  check("sim: names stored", f.names.get("8:32") === "32_A.wav" && f.names.get("8:33") === "33_B.wav");
+  check("sim: steps in order", steps.join() === "32sending,32verified,33sending,33verified", steps.join());
+  check("sim: Exchange Mode left again", f.inExchange === false && f.exchangeLeft === 1);
+  const listed = await T.withExchange(f, async () => [await T.fetchSample(f, 8, 32), await T.fetchSample(f, 8, 5),
+    await T.packNames(f), await T.slotNames(f, 8)]);
+  check("sim: fetchSample returns the sample", T.same(listed[0], A));
+  check("sim: fetchSample of an empty slot is null", listed[1] === null);
+  check("sim: packNames / slotNames", listed[2][8] === "07_New Order" && listed[3][33] === "33_B.wav", JSON.stringify(listed[2]));
+
+  let msg = await rejects(() => T.bulkUpload(f, 8, [{ slot: 32, wav: B, name: "32_x.wav" }], {}));
+  check("sim: a used slot is refused", /already in use: 33/.test(msg), msg);
+  check("sim: the refused upload changed nothing", T.same(f.slots.get("8:32"), A) && f.names.get("8:32") === "32_A.wav");
+  check("sim: Exchange Mode left after a refusal", f.inExchange === false && f.exchangeLeft === 3, f.exchangeLeft);
+  await T.bulkUpload(f, 8, [{ slot: 32, wav: B, name: "32_x.wav" }], { overwrite: true });
+  check("sim: overwrite replaces", T.same(f.slots.get("8:32"), B));
+
+  f = new FakeTracks(); f.dropAckAt = 3;
+  msg = await rejects(() => T.bulkUpload(f, 8, [{ slot: 1, wav: A, name: "01_A.wav" }], {}));
+  check("sim: a missing acknowledgement stops the upload", /was not acknowledged/.test(msg), msg);
+  check("sim: Exchange Mode left after a failure", f.inExchange === false && f.exchangeLeft === 1);
+
+  f = new FakeTracks(); f.corruptStore = true;
+  msg = await rejects(() => T.bulkUpload(f, 8, [{ slot: 1, wav: A, name: "01_A.wav" }, { slot: 2, wav: B, name: "02_B.wav" }], {}));
+  check("sim: a bad read-back is caught", /reads back different/.test(msg), msg);
+  check("sim: it stopped at the first bad slot", !f.slots.has("8:2"));
+
+  f = new FakeTracks();
+  await T.bulkUpload(f, 8, [{ slot: 4, wav: B, name: "04_B.wav" }], {});
+  await T.withExchange(f, () => T.deleteSlot(f, 8, 4));
+  check("sim: deleteSlot clears the slot and its name", !f.slots.has("8:4") && !f.names.has("8:4"));
+  const deaf = new FakeTracks(); deaf.send = function () {};
+  check("sim: deleteSlot reports a silent Tracks", /not acknowledged/.test(await rejects(() => T.deleteSlot(deaf, 8, 4))));
+}
+
+simTests().then(() => {
+  out.textContent += (fails ? fails + " of " + checks + " FAILED" : "ALL PASS (" + checks + " checks)") + "\n";
+}).catch((e) => { out.textContent += "FAIL sim crashed: " + e.stack + "\n" + (fails + 1) + " of " + checks + " FAILED\n"; });
+</script>

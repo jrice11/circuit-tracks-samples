@@ -1,0 +1,161 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Circuit Tracks WebMIDI test</title>
+<style>
+  body { font: 16px system-ui, sans-serif; margin: 12px; background: #111; color: #eee; }
+  button { font-size: 18px; padding: 12px 16px; margin: 4px 4px 4px 0; }
+  pre { white-space: pre-wrap; word-break: break-all; background: #000; padding: 8px; min-height: 8em; }
+  .ok { color: #6f6; } .bad { color: #f66; }
+</style>
+<h2>Circuit Tracks: phone test (read-only)</h2>
+<p>Plug the Tracks into the phone with a USB-C cable, then press the buttons in order.
+Nothing here writes to the Tracks. Copy the text in the box below when you ask for help.</p>
+<button id="connect">1. Connect</button>
+<button id="ping" disabled>2. Ping</button>
+<button id="packs" disabled>3. List packs</button>
+<pre id="log"></pre>
+<script>
+"use strict";
+const HEADER = [0xF0, 0x00, 0x20, 0x29];
+const TRACKS = [0x01, 0x64];
+const log = document.getElementById("log");
+const hex = (a) => Array.from(a, (b) => b.toString(16).padStart(2, "0").toUpperCase()).join(" ");
+function say(text, cls) {
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = text;
+  log.appendChild(line);
+}
+
+// What this browser is, so a failure on the phone can be told apart from a page problem.
+say("page: " + location.protocol + "//" + (location.host || "(local file)"));
+say("secure context: " + window.isSecureContext + "   WebMIDI present: " + !!navigator.requestMIDIAccess);
+say("browser: " + navigator.userAgent);
+if (navigator.permissions && navigator.permissions.query) {
+  navigator.permissions.query({ name: "midi", sysex: true })
+    .then((p) => {
+      say("MIDI sysex permission: " + p.state);
+      if (p.state === "denied") {
+        say("Chrome has already refused MIDI for this page, so it cannot even ask. " +
+            (location.protocol === "content:" ? "A page opened from content:// (an email attachment or file manager) has no web address to attach a permission to. " : "") +
+            (window.isSecureContext ? "" : "This address is not a secure context (plain http on a network address). ") +
+            "Use https or http://localhost, or mark this address as secure in chrome://flags, " +
+            "and check Chrome > Settings > Site settings for a blocked MIDI setting.", "bad");
+      }
+    })
+    .catch((e) => say("MIDI permission query not available: " + e.message));
+}
+
+let midi = null, input = null, output = null;
+let queue = [], waiter = null, partial = null;
+
+function onMessage(ev) {
+  const d = ev.data;
+  if (d[0] === 0xF0) partial = [];
+  if (partial === null) return;               // clock and other non-sysex bytes
+  for (const b of d) if (b < 0xF8) partial.push(b);
+  if (partial[partial.length - 1] === 0xF7) {
+    queue.push(Uint8Array.from(partial));
+    partial = null;
+    if (waiter) { const w = waiter; waiter = null; w(); }
+  }
+}
+
+function next(timeoutMs) {
+  return new Promise((resolve) => {
+    if (queue.length) return resolve(queue.shift());
+    const t = setTimeout(() => { waiter = null; resolve(null); }, timeoutMs);
+    waiter = () => { clearTimeout(t); resolve(queue.shift()); };
+  });
+}
+
+async function ask(bytes, first = 2000, quiet = 500) {
+  queue = [];
+  output.send(bytes);
+  const out = [];
+  let m = await next(first);
+  while (m) { out.push(m); m = await next(quiet); }
+  return out;
+}
+
+async function connect() {
+  if (!navigator.requestMIDIAccess) {
+    say("This browser has no WebMIDI (iPhone browsers do not). Use Chrome on Android.", "bad");
+    return;
+  }
+  try {
+    midi = await navigator.requestMIDIAccess({ sysex: true });
+  } catch (e) {
+    say("MIDI access refused: " + e.name + " " + e.message + ". Allow MIDI / sysex when Chrome asks.", "bad");
+    return;
+  }
+  say("MIDI access granted (sysex: " + midi.sysexEnabled + ")", "ok");
+  // Android asks "Allow Chrome to access the USB device?" when the cable is plugged in, and the
+  // port can show up late: log every change instead of only looking once.
+  midi.onstatechange = (e) => say("port " + e.port.state + "/" + e.port.connection + ": " + e.port.type + " " + e.port.name);
+  await new Promise((r) => setTimeout(r, 1500));
+  const ins = [...midi.inputs.values()], outs = [...midi.outputs.values()];
+  say("inputs:  " + (ins.map((p) => p.name).join(" | ") || "none"));
+  say("outputs: " + (outs.map((p) => p.name).join(" | ") || "none"));
+  input = ins.find((p) => /circuit tracks/i.test(p.name));
+  output = outs.find((p) => /circuit tracks/i.test(p.name));
+  if (!input || !output) {
+    say("No 'Circuit Tracks' port found. If a USB permission box appeared on the phone, allow it and press Connect again. " +
+        "Otherwise check the cable (data, not charge-only), that the Tracks is on, and that the phone is the USB host.", "bad");
+    return;
+  }
+  input.onmidimessage = onMessage;
+  await input.open(); await output.open();
+  say("connected to " + input.name, "ok");
+  document.getElementById("ping").disabled = false;
+  document.getElementById("packs").disabled = false;
+}
+
+async function ping() {
+  const r = await ask(HEADER.concat([0x00, 0x70, 0xF7]));
+  if (!r.length) { say("no reply to the ping", "bad"); return; }
+  for (const m of r) {
+    let note = "";
+    if (m.length >= 19 && m[4] === 0 && m[5] === 0x70) {
+      note = "  -> " + (m[7] === 4 ? "Circuit Tracks" : "type " + m[7]) + ", firmware build " + ((m[14] << 7) | m[15]);
+    }
+    say(hex(m) + note, note ? "ok" : "");
+  }
+}
+
+async function packs() {
+  const H = HEADER.concat(TRACKS);
+  let replies = [];
+  try {
+    say("entering Exchange Mode");
+    await ask(Uint8Array.from(H.concat([0x03, 0x40, 0xF7])));
+    replies = await ask(Uint8Array.from(H.concat([0x03, 0x0B, 0x02, 0xF7])), 3000, 800);
+  } catch (e) {
+    say("error: " + e.message, "bad");
+  } finally {
+    await ask(Uint8Array.from(H.concat([0x03, 0x41, 0xF7])), 3000, 500);
+    say("left Exchange Mode");
+  }
+  let n = 0;
+  for (const m of replies) {
+    if (m.length > 10 && m[6] === 3 && m[7] === 0x0C && m[8] === 2) {
+      n++;
+      say("pack " + m[9] + "  " + String.fromCharCode(...m.slice(10, m.length - 1)), "ok");
+    }
+  }
+  if (!n) say("no pack names came back", "bad");
+}
+
+for (const [id, fn] of [["connect", connect], ["ping", ping], ["packs", packs]]) {
+  document.getElementById(id).onclick = () => fn().catch((e) => say("error: " + e.message, "bad"));
+}
+
+// Page opened with #auto (used for testing on a PC): press the three buttons by itself.
+if (location.hash === "#auto") {
+  (async () => {
+    try { await connect(); if (output) { await ping(); await packs(); } } catch (e) { say("error: " + e.message, "bad"); }
+    say("AUTO DONE");
+  })();
+}
+</script>
